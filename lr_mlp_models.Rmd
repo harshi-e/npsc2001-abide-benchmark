@@ -1,0 +1,693 @@
+---
+title: "lr_mlp_models"
+author: "Harshitha Bhupathiraju"
+date: "2026-04-07"
+output: html_document
+---
+```{r setup}
+library(caret)
+library(pROC)
+library(nnet)
+```
+
+```{r setup}
+# phenotypic data
+pheno <- read.csv(
+  "~/ABIDE_Project/abide_data/ABIDE_pcp/Phenotypic_V1_0b_preprocessed1.csv"
+)
+pheno <- pheno[, c("SUB_ID", "DX_GROUP", "SITE_ID")]
+pheno$DX_GROUP <- ifelse(pheno$DX_GROUP == 1, 1, 0) # asd = 1, control = 0
+pheno$SUB_ID <- as.numeric(pheno$SUB_ID)
+
+
+# load fixed model splits
+splits <- read.csv(
+  "~/ABIDE_Project/graphs/model_splits.csv"
+)
+splits$SUB_ID <- as.numeric(splits$SUB_ID)
+
+
+# load all fc files
+files <- list.files(
+  "~/ABIDE_Project/abide_data/ABIDE_pcp/cpac/nofilt_noglobal",
+  pattern = "rois_cc200.1D",
+  full.names = TRUE
+)
+length(files)
+```
+
+
+```{r build dataset}
+feature_list <- list()
+labels <- c()
+site_ids <- c()
+subject_ids <- c()
+corr_matrices <- list()
+template_matrix <- cor(read.table(files[1], header = FALSE))
+region_pairs <- which(upper.tri(template_matrix), arr.ind = TRUE)
+feature_names <- paste0("R", region_pairs[,1], "_R", region_pairs[,2])
+
+for (f in files) {
+  sub_id <- sub(".*_(\\d+)_rois_cc200.1D", "\\1", basename(f))
+  sub_id <- as.numeric(sub_id)
+
+  label <- pheno$DX_GROUP[pheno$SUB_ID == sub_id]
+  site <- pheno$SITE_ID[pheno$SUB_ID == sub_id]
+
+  if (length(label) == 0) next # skip if no match
+
+  ts <- read.table(f, header = FALSE)
+  ts <- as.matrix(sapply(ts, as.numeric))
+
+  # correlation matrix
+  corr_matrix <- cor(ts)
+  corr_matrix[is.na(corr_matrix)] <- 0
+  corr_matrices[[length(corr_matrices) + 1]] <- corr_matrix
+
+  features <- corr_matrix[upper.tri(corr_matrix)] # get upper triangle indicies (brain region pairs)
+
+  feature_list[[length(feature_list) + 1]] <- features
+  labels <- c(labels, label)
+  subject_ids <- c(subject_ids, sub_id)
+  site_ids <- c(site_ids, site)
+}
+
+# corr matrices
+asd_mats <- corr_matrices[labels == 1]
+ctrl_mats <- corr_matrices[labels == 0]
+mean_asd <- Reduce("+", asd_mats) / length(asd_mats)
+mean_ctrl <- Reduce("+", ctrl_mats) / length(ctrl_mats)
+
+diff_matrix <- mean_asd - mean_ctrl
+
+# convert to dataframe
+X <- matrix(unlist(feature_list),
+            nrow = length(feature_list),
+            byrow = TRUE)
+template_matrix <- corr_matrices[[1]]
+region_pairs <- which(upper.tri(template_matrix), arr.ind = TRUE)
+
+colnames(X) <- paste0("R", region_pairs[,1], "_R", region_pairs[,2])
+
+df <- as.data.frame(X)
+df$DX_GROUP <- labels
+df$SUB_ID <- subject_ids
+df$SITE_ID <- site_ids
+
+
+# fixed model split
+df <- merge(
+  df,
+  splits,
+  by = "SUB_ID",
+  all.x = TRUE
+)
+
+table(df$split, useNA = "ifany")
+table(df$split, df$DX_GROUP)
+
+
+# verify expected fixed split
+
+stopifnot(
+  sum(df$split == "train") == 559,
+  sum(df$split == "validation") == 140,
+  sum(df$split == "test") == 172
+)
+stopifnot(
+  sum(df$split == "test" & df$DX_GROUP == 0) == 98,
+  sum(df$split == "test" & df$DX_GROUP == 1) == 74
+)
+
+image(mean_asd)
+image(mean_ctrl)
+image(diff_matrix)
+heatmap(diff_matrix)
+
+nrow(df)
+table(df$DX_GROUP)
+dim(df)
+```
+
+```{r baseline_models}
+set.seed(123)
+
+cat("Starting baseline\n")
+
+
+# macro-f1 function
+macro_f1 <- function(actual, predicted) {
+  conf <- table(
+    factor(actual, levels = c(0,1)),
+    factor(predicted, levels = c(0,1))
+  )
+  
+  # f1 for control class
+  tp_0 <- conf["0", "0"]
+  fp_0 <- sum(conf[, "0"]) - tp_0
+  fn_0 <- sum(conf["0", ]) - tp_0
+  
+  precision_0 <- ifelse(
+    tp_0 + fp_0 == 0,
+    0,
+    tp_0 / (tp_0 + fp_0)
+  )
+  recall_0 <- ifelse(
+    tp_0 + fn_0 == 0,
+    0,
+    tp_0 / (tp_0 + fn_0)
+  )
+  f1_0 <- ifelse(
+    precision_0 + recall_0 == 0,
+    0,
+    2 * precision_0 * recall_0 /
+      (precision_0 + recall_0)
+  )
+  
+  # f1 for asd class
+  tp_1 <- conf["1", "1"]
+  fp_1 <- sum(conf[, "1"]) - tp_1
+  fn_1 <- sum(conf["1", ]) - tp_1
+  
+  precision_1 <- ifelse(
+    tp_1 + fp_1 == 0,
+    0,
+    tp_1 / (tp_1 + fp_1)
+  )
+  recall_1 <- ifelse(
+    tp_1 + fn_1 == 0,
+    0,
+    tp_1 / (tp_1 + fn_1)
+  )
+  f1_1 <- ifelse(
+    precision_1 + recall_1 == 0,
+    0,
+    2 * precision_1 * recall_1 /
+      (precision_1 + recall_1)
+  )
+  
+  mean(c(f1_0, f1_1)) # macro-f1
+}
+
+
+# metrics function
+calculate_metrics <- function(actual, probabilities, predicted) {
+  accuracy <- mean(predicted == actual)
+  f1 <- macro_f1(actual, predicted)
+  conf <- table(
+    factor(actual, levels = c(0,1)),
+    factor(predicted, levels = c(0,1))
+  )
+  conf <- as.matrix(conf)
+  
+  roc_obj <- tryCatch(
+    roc(
+      actual,
+      probabilities,
+      levels = c(0,1),
+      direction = "<",
+      quiet = TRUE
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(roc_obj)) {
+    auc_value <- NA
+  } else {
+    auc_value <- as.numeric(auc(roc_obj))
+  }
+  return(
+    list(
+      accuracy = accuracy,
+      f1 = f1,
+      auc = auc_value,
+      confusion_matrix = conf
+    )
+  )
+}
+
+# fixed data splits
+train <- df[df$split == "train", ]
+validation <- df[df$split == "validation", ]
+test <- df[df$split == "test", ]
+
+
+# check split sizes
+cat("Training subjects:", nrow(train), "\n")
+cat("Validation subjects:", nrow(validation), "\n")
+cat("Test subjects:", nrow(test), "\n\n")
+
+
+# split features and labels
+feature_columns <- !(names(df) %in%
+                       c("DX_GROUP", "SUB_ID", "SITE_ID", "split"))
+train_x <- train[, feature_columns]
+validation_x <- validation[, feature_columns]
+test_x <- test[, feature_columns]
+train_y <- train$DX_GROUP
+validation_y <- validation$DX_GROUP
+test_y <- test$DX_GROUP
+
+
+# scale data
+train_x_scaled <- scale(train_x)
+train_center <- attr(train_x_scaled, "scaled:center")
+train_scale <- attr(train_x_scaled, "scaled:scale")
+
+validation_x_scaled <- scale(
+  validation_x,
+  center = train_center,
+  scale = train_scale)
+test_x_scaled <- scale(
+  test_x,
+  center = train_center,
+  scale = train_scale)
+
+nzv <- nearZeroVar(train_x_scaled) # remove near-zero variance
+
+if(length(nzv) > 0){
+  train_x_scaled <- train_x_scaled[, -nzv, drop = FALSE]
+  validation_x_scaled <-
+    validation_x_scaled[, -nzv, drop = FALSE]
+  test_x_scaled <-
+    test_x_scaled[, -nzv, drop = FALSE]
+}
+
+
+# pca
+pca <- prcomp(
+  train_x_scaled,
+  center = FALSE,
+  scale. = FALSE
+)
+
+train_pca <- pca$x[, 1:20, drop = FALSE] # keeping first 20 principal components
+
+validation_pca <- predict(
+  pca,
+  newdata = validation_x_scaled
+)[, 1:20, drop = FALSE]
+
+test_pca <- predict(
+  pca,
+  newdata = test_x_scaled
+)[, 1:20, drop = FALSE]
+
+
+# create model data
+train_data <- data.frame(train_pca)
+train_data$DX_GROUP <- train_y
+
+validation_data <- data.frame(validation_pca)
+test_data <- data.frame(test_pca)
+
+```
+
+```{r repeated runs}
+seeds <- c(123, 456, 789)
+run_results <- list()
+site_predictions <- list()
+
+# logistic regression
+for (run_seed in seeds) {
+  cat("Logistic regression with Seed: ", run_seed, "\n")
+  lr_start <- proc.time()[["elapsed"]]
+  lr_model <- glm(
+    DX_GROUP ~ .,
+    data = train_data,
+    family = "binomial"
+  )
+  lr_time <- proc.time()[["elapsed"]] - lr_start
+
+  lr_validation_probs <- predict(
+    lr_model,
+    newdata = validation_data,
+    type = "response"
+  )
+
+  lr_validation_preds <- ifelse(
+    lr_validation_probs > 0.5,
+    1,
+    0
+  )
+  
+  site_predictions[[length(site_predictions) + 1]] <-
+    data.frame(
+      Model = "Logistic Regression",
+      Seed = run_seed,
+      SITE_ID = validation$SITE_ID,
+      Actual = validation_y,
+      Probability = lr_validation_probs,
+      Predicted = lr_validation_preds
+    )
+
+  lr_validation_metrics <- calculate_metrics(
+    validation_y,
+    lr_validation_probs,
+    lr_validation_preds
+  )
+  
+  # test predictions
+  lr_inference_start <- proc.time()[["elapsed"]]
+
+  lr_test_probs <- predict(
+    lr_model,
+    newdata = test_data,
+    type = "response"
+  )
+  lr_test_preds <- ifelse(
+    lr_test_probs > 0.5,
+    1,
+    0
+  )
+
+  lr_inference_time <-
+    proc.time()[["elapsed"]] - lr_inference_start
+
+  lr_test_metrics <- calculate_metrics(
+    test_y,
+    lr_test_probs,
+    lr_test_preds
+  )
+
+  #print results
+  cat("\nTraining time:", lr_time, "seconds\n")
+
+  cat("\nValidation:\n")
+  cat("Accuracy:", lr_validation_metrics$accuracy, "\n")
+  cat("Macro-F1:", lr_validation_metrics$f1, "\n")
+  cat("ROC-AUC:", lr_validation_metrics$auc, "\n")
+
+  cat("\nNYU test:\n")
+  cat("Accuracy:", lr_test_metrics$accuracy, "\n")
+  cat("Macro-F1:", lr_test_metrics$f1, "\n")
+  cat("ROC-AUC:", lr_test_metrics$auc, "\n")
+  cat("Inference time:", lr_inference_time, "seconds\n")
+
+  cat("\nNYU confusion matrix:\n")
+  print(lr_test_metrics$confusion_matrix)
+
+  # save run
+  run_results[[length(run_results) + 1]] <- data.frame(
+    Model = "Logistic Regression",
+    Seed = run_seed,
+
+    Validation_Accuracy = lr_validation_metrics$accuracy,
+    Validation_Macro_F1 = lr_validation_metrics$f1,
+    Validation_ROC_AUC = lr_validation_metrics$auc,
+
+    Test_Accuracy = lr_test_metrics$accuracy,
+    Test_Macro_F1 = lr_test_metrics$f1,
+    Test_ROC_AUC = lr_test_metrics$auc,
+
+    Training_Time = lr_time,
+    Inference_Time = lr_inference_time
+  )
+}
+
+
+# multilayer perceptron
+for (run_seed in seeds) {
+  cat("MLP with seed: ", run_seed, "\n")
+  set.seed(run_seed)
+  
+  # train mlp
+  mlp_start <- proc.time()[["elapsed"]]
+  mlp_model <- nnet(
+    DX_GROUP ~ .,
+    data = train_data,
+    size = 5,
+    maxit = 200,
+    decay = 0.01,
+    trace = FALSE
+  )
+  mlp_time <- proc.time()[["elapsed"]] - mlp_start
+  
+  mlp_validation_probs <- predict(
+    mlp_model,
+    newdata = validation_data,
+    type = "raw"
+  )
+
+  mlp_validation_probs <- as.vector(
+    mlp_validation_probs
+  )
+
+  mlp_validation_preds <- ifelse(
+    mlp_validation_probs > 0.5,
+    1,
+    0
+  )
+  
+  site_predictions[[length(site_predictions) + 1]] <-
+    data.frame(
+      Model = "MLP",
+      Seed = run_seed,
+      SITE_ID = validation$SITE_ID,
+      Actual = validation_y,
+      Probability = mlp_validation_probs,
+      Predicted = mlp_validation_preds
+    )
+  
+  mlp_validation_metrics <- calculate_metrics(
+    validation_y,
+    mlp_validation_probs,
+    mlp_validation_preds
+  )
+  
+  
+  # test predictions
+  mlp_inference_start <- proc.time()[["elapsed"]]
+
+  mlp_test_probs <- predict(
+    mlp_model,
+    newdata = test_data,
+    type = "raw"
+  )
+
+  mlp_test_probs <- as.vector(
+    mlp_test_probs
+  )
+
+  mlp_test_preds <- ifelse(
+    mlp_test_probs > 0.5,
+    1,
+    0
+  )
+
+  mlp_inference_time <-
+    proc.time()[["elapsed"]] - mlp_inference_start
+
+  mlp_test_metrics <- calculate_metrics(
+    test_y,
+    mlp_test_probs,
+    mlp_test_preds
+  )
+  
+  # print results
+  cat("\nTraining time:", mlp_time, "seconds\n")
+
+  cat("\nValidation:\n")
+  cat("Accuracy:", mlp_validation_metrics$accuracy, "\n")
+  cat("Macro-F1:", mlp_validation_metrics$f1, "\n")
+  cat("ROC-AUC:", mlp_validation_metrics$auc, "\n")
+
+  cat("\nNYU test:\n")
+  cat("Accuracy:", mlp_test_metrics$accuracy, "\n")
+  cat("Macro-F1:", mlp_test_metrics$f1, "\n")
+  cat("ROC-AUC:", mlp_test_metrics$auc, "\n")
+  cat("Inference time:", mlp_inference_time, "seconds\n")
+
+  cat("\nNYU confusion matrix:\n")
+  print(mlp_test_metrics$confusion_matrix)
+  
+  # save run
+  run_results[[length(run_results) + 1]] <- data.frame(
+    Model = "MLP",
+    Seed = run_seed,
+
+    Validation_Accuracy = mlp_validation_metrics$accuracy,
+    Validation_Macro_F1 = mlp_validation_metrics$f1,
+    Validation_ROC_AUC = mlp_validation_metrics$auc,
+
+    Test_Accuracy = mlp_test_metrics$accuracy,
+    Test_Macro_F1 = mlp_test_metrics$f1,
+    Test_ROC_AUC = mlp_test_metrics$auc,
+
+    Training_Time = mlp_time,
+    Inference_Time = mlp_inference_time
+  )
+}
+
+
+# per-site validation performance
+site_predictions_df <- do.call(rbind, site_predictions)
+site_run_results <- list()
+
+site_groups <- split(
+  site_predictions_df,
+  list(
+    site_predictions_df$Model,
+    site_predictions_df$Seed,
+    site_predictions_df$SITE_ID
+  ),
+  drop = TRUE
+)
+
+for (group in site_groups) {
+  site_metrics <- calculate_metrics(
+    actual = group$Actual,
+    probabilities = group$Probability,
+    predicted = group$Predicted
+  )
+  
+  control_count <- sum(group$Actual == 0)
+  asd_count <- sum(group$Actual == 1)
+
+  site_run_results[[length(site_run_results) + 1]] <-
+    data.frame(
+      Model = group$Model[1],
+      Seed = group$Seed[1],
+      SITE_ID = group$SITE_ID[1],
+      N = nrow(group),
+      Controls = control_count,
+      ASD = asd_count,
+      Accuracy = site_metrics$accuracy,
+      Macro_F1 = site_metrics$f1,
+      ROC_AUC = site_metrics$auc
+    )
+}
+
+site_run_results <- do.call(rbind, site_run_results)
+
+
+cat("Per-site Validation Results from each run\n")
+print(
+  site_run_results[
+    order(site_run_results$Model,
+          site_run_results$SITE_ID,
+          site_run_results$Seed),
+  ],
+  row.names = FALSE
+)
+
+
+# per-site mean and sd across runs
+site_summary_groups <- split(
+  site_run_results,
+  interaction(
+    site_run_results$Model,
+    site_run_results$SITE_ID,
+    drop = TRUE
+  )
+)
+
+site_summary <- do.call(
+  rbind,
+  lapply(site_summary_groups, function(group) {
+
+    data.frame(
+      Model = group$Model[1],
+      SITE_ID = group$SITE_ID[1],
+      N = group$N[1],
+      Controls = group$Controls[1],
+      ASD = group$ASD[1],
+
+      Mean_Accuracy = mean(group$Accuracy, na.rm = TRUE),
+      SD_Accuracy = sd(group$Accuracy, na.rm = TRUE),
+
+      Mean_Macro_F1 = mean(group$Macro_F1, na.rm = TRUE),
+      SD_Macro_F1 = sd(group$Macro_F1, na.rm = TRUE),
+
+      Mean_ROC_AUC = mean(group$ROC_AUC, na.rm = TRUE),
+      SD_ROC_AUC = sd(group$ROC_AUC, na.rm = TRUE)
+    )
+  })
+)
+
+
+cat("per-site Validation results - mean +/- sd\n")
+print(
+  site_summary[
+    order(site_summary$SITE_ID, site_summary$Model),
+  ],
+  row.names = FALSE
+)
+
+# save results 
+write.csv(
+  site_run_results,
+  "per_site_validation_each_run.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  site_summary,
+  "per_site_validation_summary.csv",
+  row.names = FALSE
+)
+
+
+# combining all results
+all_results <- do.call(rbind, run_results)
+
+cat("Individual run results\n")
+print(all_results, row.names = FALSE)
+
+metrics <- c(
+  "Validation_Accuracy",
+  "Validation_Macro_F1",
+  "Validation_ROC_AUC",
+  "Test_Accuracy",
+  "Test_Macro_F1",
+  "Test_ROC_AUC",
+  "Training_Time",
+  "Inference_Time"
+)
+
+summary_results <- data.frame()
+for (model_name in unique(all_results$Model)) {
+  model_runs <- all_results[
+    all_results$Model == model_name,
+  ]
+  for (metric in metrics) {
+    values <- model_runs[[metric]]
+    summary_results <- rbind(
+      summary_results,
+      data.frame(
+        Model = model_name,
+        Metric = metric,
+        Mean = mean(values, na.rm = TRUE),
+        SD = sd(values, na.rm = TRUE)
+      )
+    )
+  }
+}
+
+cat("Mean and sd across 3 runs\n")
+print(summary_results, row.names = FALSE)
+
+
+# performance table
+performance_summary <- summary_results[
+  summary_results$Metric %in% c(
+    "Test_Accuracy",
+    "Test_Macro_F1",
+    "Test_ROC_AUC"
+  ),
+]
+
+performance_summary$Mean_SD <- sprintf(
+  "%.4f +/- %.4f",
+  performance_summary$Mean,
+  performance_summary$SD
+)
+
+cat("NYU Test performance - mean +/- sd\n")
+print(
+  performance_summary[
+    , c("Model", "Metric", "Mean_SD")
+  ],
+  row.names = FALSE
+)
+```
